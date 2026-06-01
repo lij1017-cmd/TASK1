@@ -31,7 +31,6 @@ def load_data(path):
         data = df.iloc[1:].copy()
         data['date'] = pd.to_datetime(data.iloc[:, 0].astype(str).str.extract(r'(\d{8})')[0], format='%Y%m%d')
         data = data.drop(columns=[data.columns[0]]).set_index('date')
-        # Requirement 5: bfill for start, ffill for gaps
         return data.apply(pd.to_numeric, errors='coerce').ffill().bfill()
     c = clean('收盤價'); v = clean('成交量')
     ce = clean('反向ETF收盤價'); ve = clean('反向ETF成交量')
@@ -76,18 +75,18 @@ def run_simulation(close, vol, inv_etfs):
             curr_yr = date.year
         today_p = close.loc[date]
 
-        # Log daily holdings
+        # 1. Log holdings snapshot at start of day
         for t, p in active_pos.items():
             holdings_log.append({
-                'date': date, 'ticker': t, 'type': p['type'],
+                'date': date.strftime('%Y-%m-%d'), 'ticker': t, 'type': p['type'],
                 'entry_date': p['entry_date'], 'entry_p': f"{p['entry_p']:.2f}",
                 'current_p': f"{today_p[t]:.2f}", 'stop_loss': f"{p['sl']:.2f}"
             })
 
-        # Exit logic
+        # 2. Check Exits
         exiting = []
         for t, p in active_pos.items():
-            if p['entry_date'] == date: continue
+            if p['entry_date'] == date.strftime('%Y-%m-%d'): continue
             cp = float(today_p[t])
             if cp < p['sl'] or (hist.loc[date, t] < 0 and t not in inv_etfs):
                 reason = "Trailing Stop" if cp < p['sl'] else "Momentum Reversal"
@@ -104,34 +103,36 @@ def run_simulation(close, vol, inv_etfs):
                 ret = (today_p[t] - yp[t]) / yp[t]
                 day_pnl += ret * notional
 
+        # 3. Process Exits
         for t, reason in exiting:
             p = active_pos[t]; notional = INVEST_POOL / MAX_POSITIONS
             tax = TAX_ETF if t in inv_etfs else TAX_STOCK
             ypv = float(close.loc[dates[i-1]][t]); tpv = float(today_p[t])
             exit_p = p['sl'] if (tpv < p['sl']) else tpv
             exit_ret = (exit_p - ypv)/ypv
+
             day_pnl += (exit_ret - (tpv - ypv)/ypv) * notional
             cost = notional * (COMMISSION + tax)
             day_pnl -= cost
 
-            pnl_val = (exit_p - p['entry_p'])/p['entry_p'] * notional - cost
             trade_log.append({
-                'ticker': t, 'type': p['type'], 'entry_date': p['entry_date'], 'exit_date': date,
-                'entry_p': p['entry_p'], 'exit_p': exit_p, 'entry_reason': p['reason'], 'exit_reason': reason,
-                'pnl_net': pnl_val
+                'ticker': t, 'type': p['type'], 'entry_date': p['entry_date'], 'exit_date': date.strftime('%Y-%m-%d'),
+                'entry_p': f"{p['entry_p']:.2f}", 'exit_p': f"{exit_p:.2f}", 'entry_reason': p['reason'], 'exit_reason': reason,
+                'pnl_net': (exit_p - p['entry_p'])/p['entry_p'] * notional - cost
             })
             del active_pos[t]
 
-        # Entry logic
+        # 4. Entry logic
         if i > 0:
             y_date = dates[i-1]; br = breadth.loc[y_date]
             candidates = []
             for t in close.columns:
                 if t in active_pos: continue
                 tpv = float(today_p[t])
-                reason = "Breakout" if today_p[t] >= res.shift(1).loc[y_date, t] else "MACD Cross"
+
                 if br > 0.40:
                     if long_sig.loc[y_date, t] and t not in inv_etfs:
+                        reason = "Breakout" if today_p[t] >= res.shift(1).loc[y_date, t] else "MACD Cross"
                         candidates.append({'t': t, 'type': 'long', 'p': tpv, 'sl': tpv*0.975, 'score': roc.loc[y_date, t], 'reason': reason})
                 elif br < 0.25:
                     if t in inv_etfs and long_sig.loc[y_date, t]:
@@ -140,7 +141,7 @@ def run_simulation(close, vol, inv_etfs):
             if candidates:
                 space = MAX_POSITIONS - len(active_pos)
                 for c in sorted(candidates, key=lambda x: x['score'], reverse=True)[:max(space, 0)]:
-                    active_pos[c['t']] = {'type': c['type'], 'entry_p': c['p'], 'entry_date': date, 'sl': c['sl'], 'reason': c['reason']}
+                    active_pos[c['t']] = {'type': c['type'], 'entry_p': c['p'], 'entry_date': date.strftime('%Y-%m-%d'), 'sl': c['sl'], 'reason': c['reason']}
                     day_pnl -= (INVEST_POOL / MAX_POSITIONS) * COMMISSION
 
         total_pnl += day_pnl; annual_profit += day_pnl
@@ -160,7 +161,6 @@ def main():
 
     print(f"\nFinal Overall Results:\nCAGR: {c_all:.2%}\nMDD: {m_all:.2%}\nCalmar: {cl_all:.2f}")
 
-    # 1. Summary Sheet
     summary_data = [
         {'Metric': 'Overall CAGR', 'Value': f"{c_all:.2%}"},
         {'Metric': 'Overall MDD', 'Value': f"{m_all:.2%}"},
@@ -175,14 +175,12 @@ def main():
         summary_data.append({'Metric': f'Year {yr} Calmar', 'Value': f"{ycl:.2f}"})
         print(f"{yr} | Return: {yc:>7.2%} | MDD: {ym:>7.2%}")
 
-    # Export report_ep001.xlsx
     with pd.ExcelWriter('report_ep001.xlsx', engine='openpyxl') as writer:
         pd.DataFrame(summary_data).to_excel(writer, sheet_name='summary', index=False)
         res[['day_pnl', 'cum_profit', 'Equity_Curve', 'annual_profit', 'n']].reset_index().to_excel(writer, sheet_name='equity_curve', index=False)
         holdings.to_excel(writer, sheet_name='daily_holdings', index=False)
         trades.to_excel(writer, sheet_name='trade_details', index=False)
 
-    # EP-001.md
     commit_hash = os.popen('git rev-parse HEAD').read().strip()
     with open('EP-001.md', 'w') as f:
         f.write(f"# EP-001: MACD-EMA-SR Market Breadth Optimized Portfolio\nDate: 2026-05-26\nGit Commit Hash: {commit_hash}\n\n")
